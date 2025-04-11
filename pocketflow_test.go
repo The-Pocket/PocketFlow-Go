@@ -2,8 +2,9 @@ package pocketflow_test
 
 import (
 	"fmt"
-	"strconv"
+	// "strconv" // Removed unused import
 	"testing"
+	"time" // Added missing import
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -65,14 +66,19 @@ func resultCaptureNode() pf.BaseNode {
 				// Provide a default if not found, mirroring Java test
 				return -999, nil
 			}
-			return val.(int), nil
+			// Ensure the value is an int before returning
+            intVal, ok := val.(int)
+            if !ok {
+                return -999, fmt.Errorf("currentValue was not an int: %T", val)
+            }
+			return intVal, nil
 		}).
 		SetExec(func(prepResult any, params pf.SharedContext) (any, error) {
 			capturedVal := prepResult.(int)
 			params["capturedValue"] = capturedVal // Store in node's *own* params
 			return nil, nil                      // No meaningful exec result needed
 		})
-		// Default Post is sufficient (returns DefaultAction)
+	// Default Post is sufficient (returns DefaultAction)
 	return n
 }
 
@@ -191,7 +197,7 @@ func TestBatchFlowExecution(t *testing.T) {
 func TestNodeRetrySuccess(t *testing.T) {
 	execCount := 0
 	node := pf.NewNode().
-		SetRetry(3, 1*time.Millisecond).
+		SetRetry(3, 1*time.Millisecond). // Use time.Millisecond
 		SetExec(func(prepResult any, params pf.SharedContext) (any, error) {
 			execCount++
 			if execCount < 3 {
@@ -209,7 +215,7 @@ func TestNodeRetryFailureWithFallback(t *testing.T) {
 	execCount := 0
 	fallbackCalled := false
 	node := pf.NewNode().
-		SetRetry(2, 1*time.Millisecond).
+		SetRetry(2, 1*time.Millisecond). // Use time.Millisecond
 		SetExec(func(prepResult any, params pf.SharedContext) (any, error) {
 			execCount++
 			return nil, fmt.Errorf("permanent failure %d", execCount) // Always fail
@@ -230,12 +236,12 @@ func TestNodeRetryFailureWithFallback(t *testing.T) {
 func TestNodeRetryFailureWithoutFallback(t *testing.T) {
 	execCount := 0
 	node := pf.NewNode().
-		SetRetry(2, 1*time.Millisecond).
+		SetRetry(2, 1*time.Millisecond). // Use time.Millisecond
 		SetExec(func(prepResult any, params pf.SharedContext) (any, error) {
 			execCount++
 			return nil, fmt.Errorf("permanent failure %d", execCount) // Always fail
 		})
-		// No fallback set
+	// No fallback set
 
 	_, err := node.Run(make(pf.SharedContext))
 	require.Error(t, err)
@@ -249,7 +255,7 @@ func TestBatchNodeItemRetryAndFallback(t *testing.T) {
 	itemFallbackCalled := make(map[string]bool)
 
 	bnode := pf.NewBatchNode().
-		SetRetry(3, 1*time.Millisecond). // Retries per item
+		SetRetry(3, 1*time.Millisecond). // Use time.Millisecond - Retries per item
 		SetPrep(func(ctx pf.SharedContext, params pf.SharedContext) ([]any, error) {
 			return []any{"ok", "fail_once", "fail_always"}, nil
 		}).

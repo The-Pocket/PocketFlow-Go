@@ -3,8 +3,6 @@ package pocketflow
 import (
 	"fmt"
 	"log"
-	"maps" // Requires Go 1.21+, replace with loop copy for older versions
-	"reflect"
 	"time"
 )
 
@@ -101,12 +99,11 @@ func (n *nodeCore) SetParams(params map[string]any) {
 	n.initCore()
 	if params != nil {
 		// Create a copy to avoid external modification issues
-		n.params = maps.Clone(params) // Go 1.21+
-		// For older Go:
-		// n.params = make(SharedContext, len(params))
-		// for k, v := range params {
-		// 	n.params[k] = v
-		// }
+		// Replace with manual copy loop for older Go versions:
+		n.params = make(SharedContext, len(params))
+		for k, v := range params {
+			n.params[k] = v
+		}
 	} else {
 		n.params = make(SharedContext)
 	}
@@ -567,12 +564,23 @@ func (f *Flow) Exec(prepResult any) (any, error) {
 	// This is called internally by InternalRun after Flow's Prep.
 	// The 'prepResult' here is the result of Flow.Prep, not a node's prep.
 	// The 'execResult' of a Flow is the final action string from orchestration.
-	finalAction, err := f.orchestrate(prepResult.(SharedContext), nil) // Run orchestration
+	// We need the context here for orchestrate, assume prepResult is the context for simplicity
+	// although Flow's Prep doesn't *have* to return the context. Let's pass ctx directly.
+	// This requires changing the call site in InternalRun.
+	sharedCtx, ok := prepResult.(SharedContext)
+	if !ok {
+		// Fallback or error? Let's assume the caller (InternalRun) passed the correct context.
+		// This indicates an internal logic error if it happens.
+		return "", newPocketFlowError(fmt.Sprintf("Internal error: Flow.Exec expected SharedContext, got %T", prepResult), nil)
+	}
+
+	finalAction, err := f.orchestrate(sharedCtx, nil) // Run orchestration with the context
 	if err != nil {
 		return "", err // Return error, action is irrelevant if orchestration failed
 	}
 	return finalAction, nil // Return the final action as the result
 }
+
 
 // Post for the Flow runs after orchestration completes. Default returns the final action.
 func (f *Flow) Post(ctx SharedContext, prepResult any, execResult any) (string, error) {
@@ -599,8 +607,7 @@ func (f *Flow) InternalRun(ctx SharedContext) (string, error) {
 	}
 
 	// 2. Run Flow's Exec phase (which triggers orchestration)
-	// Pass the *original* shared context to orchestration.
-	// Flow's prepResult isn't typically used directly in orchestration nodes.
+	// Pass the *original* shared context to Exec, as Exec now expects it.
 	flowExecResult, err := f.Exec(ctx) // Exec calls orchestrate
 	if err != nil {
 		// Error likely came from a node within orchestrate
@@ -615,6 +622,7 @@ func (f *Flow) InternalRun(ctx SharedContext) (string, error) {
 
 	return finalAction, nil
 }
+
 
 // orchestrate executes the node chain starting from startNode.
 // initialParams are merged with the flow's own params for the *first* node.
@@ -631,20 +639,33 @@ func (f *Flow) orchestrate(ctx SharedContext, initialParams SharedContext) (stri
 
 	// Prepare initial parameters for the first node run
 	// Combine Flow's params and any specific initialParams for this run
-	combinedParams := maps.Clone(f.params) // Start with flow's base params (Go 1.21+)
-	// For older Go: loop copy f.params
+	// Replace with manual copy loop:
+	combinedParams := make(SharedContext, len(f.params))
+	for k, v := range f.params {
+		combinedParams[k] = v
+	}
+
 	if initialParams != nil {
-		maps.Copy(combinedParams, initialParams) // Merge initialParams, overwriting base (Go 1.21+)
-        // For older Go: loop copy initialParams into combinedParams
+		// Replace with manual copy loop:
+		for k, v := range initialParams {
+			combinedParams[k] = v // Add or overwrite keys from initialParams
+		}
 	}
 
 
 	for currentNode != nil {
 		// Set the combined params *before* running the node
-		// Subsequent nodes will inherit params via the nodeCore logic if not explicitly set otherwise
-		currentNode.SetParams(combinedParams)
-		// Clear combinedParams after first use to avoid reapplying initialParams accidentally
-		combinedParams = nil
+        // Only apply combinedParams on the *first* iteration
+		if combinedParams != nil {
+		    currentNode.SetParams(combinedParams)
+            combinedParams = nil // Clear after first use
+        } else {
+             // Ensure subsequent nodes get at least the Flow's base params if theirs are unset.
+             if len(currentNode.GetParams()) == 0 && len(f.params) > 0 {
+                  currentNode.SetParams(f.params) // Give it the flow's base params if it has none
+             }
+        }
+
 
 		// Execute the node's full lifecycle (Prep, Exec, Post)
 		lastAction, err = currentNode.InternalRun(ctx)
@@ -656,28 +677,14 @@ func (f *Flow) orchestrate(ctx SharedContext, initialParams SharedContext) (stri
 		// Get the next node based on the action returned by Post
 		currentNode = currentNode.GetNextNode(lastAction)
 
-		// If we are moving to a next node, ensure its params are potentially updated
-		// (e.g., if Flow params changed or if we want nodes to inherit params)
-        // For now, node params are set once at the start of orchestrate,
-        // or individually if nodes modify their own params. Revisit if complex
-        // parameter propagation is needed between nodes.
-		if currentNode != nil {
-             // Option 1: Inherit Flow's base params if node params are empty? (Maybe too complex)
-             // Option 2: Let nodes manage their own params set via SetParams before InternalRun. (Current behaviour)
-             // Option 3: Explicitly copy params from previous node? (Seems unintuitive)
-             // Sticking with Option 2 for simplicity, matches Java more closely.
-             // If combinedParams was used, we need ensure subsequent nodes get *some* params.
-             // Let's ensure subsequent nodes get at least the Flow's base params if theirs are unset.
-             if len(currentNode.GetParams()) == 0 && len(f.params) > 0 {
-                  currentNode.SetParams(f.params) // Give it the flow's base params if it has none
-             }
-		}
-
+        // Parameter propagation logic for subsequent nodes (revisit if needed)
+        // The current logic sets params once at the start or uses node's existing/flow base.
 	}
 
 	// Orchestration finished successfully, return the last action determined
 	return lastAction, nil
 }
+
 
 // --- Batch Flow ---
 
@@ -732,7 +739,13 @@ func (bf *BatchFlow) Prep(ctx SharedContext) (any, error) {
 // Exec for BatchFlow runs the orchestration for each batch item.
 // The 'prepResult' here is the []SharedContext from BatchFlow.Prep.
 func (bf *BatchFlow) Exec(prepResult any) (any, error) {
-    batchParamsList, ok := prepResult.([]SharedContext)
+	// We need the original context for the orchestrate calls.
+	// InternalRun should pass it. For now, let's assume prepResult contains it implicitly
+	// or redesign how context is passed through BatchFlow's Exec.
+	// Safest: Assume InternalRun passes the context correctly and prepResult is the list.
+	// Let's adjust the call site in InternalRun.
+
+	batchParamsList, ok := prepResult.([]SharedContext)
     if prepResult != nil && !ok {
         return "", newPocketFlowError(fmt.Sprintf("Internal error: prepResult in BatchFlow %T Exec was not []SharedContext (%T)", bf, prepResult), nil)
     }
@@ -740,20 +753,16 @@ func (bf *BatchFlow) Exec(prepResult any) (any, error) {
 		 batchParamsList = []SharedContext{}
 	 }
 
+    // We need the actual SharedContext. Where does it come from?
+    // It should be passed *alongside* the prepResult by InternalRun.
+    // Let's redefine Exec slightly to accept it, or rely on a field.
+    // Simpler: Let InternalRun handle context passing to orchestrate directly.
+    // Exec just needs to return the batchParamsList for Post.
 
-    for i, batchParams := range batchParamsList {
-        // Run the embedded Flow's orchestration logic for each parameter set.
-        // Pass current batchParams as initialParams for this specific run.
-        _, err := bf.Flow.orchestrate(ctx, batchParams) // Use the SAME shared context for all runs
-        if err != nil {
-            // If one batch run fails, fail the whole BatchFlow execution
-            return "", newPocketFlowError(fmt.Sprintf("Orchestration failed for batch item %d in %T", i, bf), err)
-        }
-        // Result (lastAction) of individual orchestrate runs is ignored here; side effects matter.
-    }
+	// The actual orchestration happens in InternalRun using this list.
+	// This function's role is primarily semantic within the BaseNode interface call chain.
+	// It returns the data needed for Post.
 
-    // The overall 'result' of BatchFlow's Exec phase is considered the original batch params list
-    // This is needed for the PostBatchFunc signature.
     return batchParamsList, nil
 }
 
@@ -793,27 +802,42 @@ func (bf *BatchFlow) Run(ctx SharedContext) (string, error) {
 func (bf *BatchFlow) InternalRun(ctx SharedContext) (string, error) {
 	// 1. Run BatchFlow's Prep phase (PrepBatchFunc)
 	// Should return []SharedContext
-	prepBatchResult, err := bf.Prep(ctx)
+	prepBatchResultAny, err := bf.Prep(ctx)
 	if err != nil {
 		return "", newPocketFlowError(fmt.Sprintf("PrepBatch phase failed for BatchFlow %T", bf), err)
 	}
 
-	// 2. Run BatchFlow's Exec phase (Orchestrates for each item in prepBatchResult)
-	// Exec returns the original prepBatchResult list after successful runs
-	execResult, err := bf.Exec(prepBatchResult) // Exec calls orchestrate multiple times
-	if err != nil {
-		// Error likely came from a node within one of the orchestrate runs
-		return "", err // Don't wrap again
+    batchParamsList, ok := prepBatchResultAny.([]SharedContext)
+	if prepBatchResultAny != nil && !ok {
+        return "", newPocketFlowError(fmt.Sprintf("Internal error: PrepBatch phase in BatchFlow %T did not return []SharedContext (%T)", bf, prepBatchResultAny), nil)
+    }
+     if batchParamsList == nil {
+		 batchParamsList = []SharedContext{}
+	 }
+
+	// 2. Run the orchestration for each item in batchParamsList
+	for i, batchParams := range batchParamsList {
+		// Run the embedded Flow's orchestration logic for each parameter set.
+		// Pass the *original* shared context and current batchParams.
+		_, err := bf.Flow.orchestrate(ctx, batchParams)
+		if err != nil {
+			// If one batch run fails, fail the whole BatchFlow execution
+			return "", newPocketFlowError(fmt.Sprintf("Orchestration failed for batch item %d in %T", i, bf), err)
+		}
+		// Result (lastAction) of individual orchestrate runs is ignored here; side effects matter.
 	}
 
 	// 3. Run BatchFlow's Post phase (PostBatchFunc)
-	finalAction, err := bf.Post(ctx, prepBatchResult, execResult) // Pass prep and exec results
+	// The result of the "Exec" phase semantically is the list itself.
+	execResult := batchParamsList
+	finalAction, err := bf.Post(ctx, prepBatchResultAny, execResult)
 	if err != nil {
 		return "", newPocketFlowError(fmt.Sprintf("PostBatch phase failed for BatchFlow %T", bf), err)
 	}
 
 	return finalAction, nil
 }
+
 
 // --- Type checking helper (optional but potentially useful) ---
 // Example: Check if a result from 'any' is actually an int
