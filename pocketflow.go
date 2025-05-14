@@ -1,13 +1,41 @@
 package pocketflow
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
 )
 
-// SharedContext is the map passed between nodes.
-type SharedContext = map[string]any
+type PfContext struct {
+	context.Context
+	param map[any]any
+}
+
+func (c *PfContext) Value(key any) any {
+	if c.param == nil {
+		c.param = make(map[any]any)
+	}
+	if v, ok := c.param[key]; ok {
+		return v
+	}
+	return c.Context.Value(key)
+}
+
+func (c *PfContext) SetValue(key any, value any) {
+	if c.param == nil {
+		c.param = make(map[any]any)
+	}
+	c.param[key] = value
+}
+
+func WithParam(parent context.Context, param map[any]any) *PfContext {
+	c := PfContext{
+		Context: parent,
+		param:   param,
+	}
+	return &c
+}
 
 // DefaultAction is the action name used when a node's Post returns an empty string or nil action.
 const DefaultAction = "default"
@@ -45,15 +73,15 @@ func logWarn(format string, v ...any) {
 type BaseNode interface {
 	// Prep prepares input for Exec using the shared context.
 	// Returns the prepared data (can be nil) and an error.
-	Prep(ctx SharedContext) (any, error)
+	Prep(ctx *PfContext) (any, error)
 
 	// Exec performs the main work using the result from Prep.
 	// Returns the execution result (can be nil) and an error.
-	Exec(prepResult any) (any, error)
+	Exec(ctx *PfContext, prepResult any) (any, error)
 
 	// Post processes results, updates context, and returns the next action string.
 	// An empty string implies DefaultAction. Returns an error if post-processing fails.
-	Post(ctx SharedContext, prepResult any, execResult any) (string, error)
+	Post(ctx *PfContext, prepResult any, execResult any) (string, error)
 
 	// SetParams sets node-specific parameters. Returns the node for chaining.
 	SetParams(params map[string]any) BaseNode
@@ -72,23 +100,23 @@ type BaseNode interface {
 
 	// Run executes a single node's lifecycle (prep, exec, post). Useful for standalone execution.
 	// Returns the resulting action and error.
-	Run(ctx SharedContext) (string, error)
+	Run(ctx *PfContext) (string, error)
 
 	// InternalRun is used by Flow orchestration to execute the node lifecycle.
 	// Separated from Run to prevent potential issues if Run is overridden incorrectly.
-	InternalRun(ctx SharedContext) (string, error)
+	InternalRun(ctx *PfContext) (string, error)
 }
 
 // --- Common Node Implementation Details ---
 
 type nodeCore struct {
-	params     SharedContext
+	params     map[string]any
 	successors map[string]BaseNode
 }
 
 func (n *nodeCore) initCore() {
 	if n.params == nil {
-		n.params = make(SharedContext)
+		n.params = make(map[string]any)
 	}
 	if n.successors == nil {
 		n.successors = make(map[string]BaseNode)
@@ -100,12 +128,12 @@ func (n *nodeCore) SetParams(params map[string]any) {
 	if params != nil {
 		// Create a copy to avoid external modification issues
 		// Replace with manual copy loop for older Go versions:
-		n.params = make(SharedContext, len(params))
+		n.params = make(map[string]any, len(params))
 		for k, v := range params {
 			n.params[k] = v
 		}
 	} else {
-		n.params = make(SharedContext)
+		n.params = make(map[string]any)
 	}
 }
 
@@ -160,12 +188,12 @@ type Node struct {
 	WaitMilliseconds time.Duration // Use time.Duration for clarity
 
 	// User-defined functions for node logic
-	PrepFunc func(ctx SharedContext, params SharedContext) (any, error)
-	ExecFunc func(prepResult any, params SharedContext) (any, error)
-	PostFunc func(ctx SharedContext, prepResult any, execResult any, params SharedContext) (string, error)
+	PrepFunc func(ctx *PfContext, params map[string]any) (any, error)
+	ExecFunc func(ctx *PfContext, params map[string]any, prepResult any) (any, error)
+	PostFunc func(ctx *PfContext, params map[string]any, prepResult any, execResult any) (string, error)
 
 	// Optional fallback function if all retries fail
-	ExecFallbackFunc func(prepResult any, params SharedContext, lastErr error) (any, error)
+	ExecFallbackFunc func(ctx *PfContext, params map[string]any, prepResult any, lastErr error) (any, error)
 }
 
 // NewNode creates a new Node with default retry settings (1 try, 0 wait).
@@ -173,11 +201,12 @@ func NewNode() *Node {
 	n := &Node{
 		MaxRetries:       1,
 		WaitMilliseconds: 0,
-		PrepFunc:         func(ctx SharedContext, params SharedContext) (any, error) { return nil, nil }, // Default no-op
-		ExecFunc:         func(prepResult any, params SharedContext) (any, error) { return nil, nil }, // Default no-op
-		PostFunc: func(ctx SharedContext, prepResult any, execResult any, params SharedContext) (string, error) {
-			return DefaultAction, nil // Default action
-		},
+		PrepFunc:         func(ctx *PfContext, params map[string]any) (any, error) { return nil, nil },                 // Default no-op
+		ExecFunc:         func(ctx *PfContext, params map[string]any, prepResult any) (any, error) { return nil, nil }, // Default no-op
+		PostFunc: func(ctx *PfContext, params map[string]any, prepResult any, execResult any) (string, error) {
+			return DefaultAction, nil
+		}, // Default action
+
 	}
 	n.initCore()
 	return n
@@ -197,25 +226,25 @@ func (n *Node) SetRetry(maxRetries int, waitMilliseconds time.Duration) *Node {
 }
 
 // SetPrep sets the PrepFunc.
-func (n *Node) SetPrep(f func(ctx SharedContext, params SharedContext) (any, error)) *Node {
+func (n *Node) SetPrep(f func(ctx *PfContext, params map[string]any) (any, error)) *Node {
 	n.PrepFunc = f
 	return n
 }
 
 // SetExec sets the ExecFunc.
-func (n *Node) SetExec(f func(prepResult any, params SharedContext) (any, error)) *Node {
+func (n *Node) SetExec(f func(ctx *PfContext, params map[string]any, prepResult any) (any, error)) *Node {
 	n.ExecFunc = f
 	return n
 }
 
 // SetPost sets the PostFunc.
-func (n *Node) SetPost(f func(ctx SharedContext, prepResult any, execResult any, params SharedContext) (string, error)) *Node {
+func (n *Node) SetPost(f func(ctx *PfContext, params map[string]any, prepResult any, execResult any) (string, error)) *Node {
 	n.PostFunc = f
 	return n
 }
 
 // SetFallback sets the ExecFallbackFunc.
-func (n *Node) SetFallback(f func(prepResult any, params SharedContext, lastErr error) (any, error)) *Node {
+func (n *Node) SetFallback(f func(ctx *PfContext, params map[string]any, prepResult any, lastErr error) (any, error)) *Node {
 	n.ExecFallbackFunc = f
 	return n
 }
@@ -231,40 +260,40 @@ func (n *Node) Next(action string, node BaseNode) BaseNode {
 	return n.nodeCore.Next(action, node)
 }
 
-func (n *Node) Prep(ctx SharedContext) (any, error) {
+func (n *Node) Prep(ctx *PfContext) (any, error) {
 	if n.PrepFunc == nil {
 		return nil, nil // Default behavior
 	}
 	return n.PrepFunc(ctx, n.params)
 }
 
-func (n *Node) Exec(prepResult any) (any, error) {
+func (n *Node) Exec(ctx *PfContext, prepResult any) (any, error) {
 	// This is the public Exec, usually called via InternalRun which handles retry
 	if n.ExecFunc == nil {
 		return nil, nil
 	}
-	return n.ExecFunc(prepResult, n.params)
+	return n.ExecFunc(ctx, n.params, prepResult)
 }
 
-func (n *Node) Post(ctx SharedContext, prepResult any, execResult any) (string, error) {
+func (n *Node) Post(ctx *PfContext, prepResult any, execResult any) (string, error) {
 	if n.PostFunc == nil {
 		return DefaultAction, nil
 	}
-	action, err := n.PostFunc(ctx, prepResult, execResult, n.params)
+	action, err := n.PostFunc(ctx, n.params, prepResult, execResult)
 	if err == nil && action == "" {
 		action = DefaultAction
 	}
 	return action, err
 }
 
-func (n *Node) Run(ctx SharedContext) (string, error) {
+func (n *Node) Run(ctx *PfContext) (string, error) {
 	if len(n.successors) > 0 {
 		logWarn("Node %T has successors, but Run() was called directly. Successors won't be executed by this call. Use Flow.Run() for orchestration.", n)
 	}
 	return n.InternalRun(ctx)
 }
 
-func (n *Node) InternalRun(ctx SharedContext) (string, error) {
+func (n *Node) InternalRun(ctx *PfContext) (string, error) {
 	prepRes, err := n.Prep(ctx)
 	if err != nil {
 		return "", newPocketFlowError(fmt.Sprintf("Prep phase failed in %T", n), err)
@@ -275,7 +304,7 @@ func (n *Node) InternalRun(ctx SharedContext) (string, error) {
 	currentRetry := 0
 
 	for currentRetry = 0; currentRetry < n.MaxRetries; currentRetry++ {
-		execRes, lastExecErr = n.Exec(prepRes) // Call the non-retry Exec
+		execRes, lastExecErr = n.Exec(ctx, prepRes) // Call the non-retry Exec
 		if lastExecErr == nil {
 			break // Success
 		}
@@ -287,7 +316,7 @@ func (n *Node) InternalRun(ctx SharedContext) (string, error) {
 	// If all retries failed
 	if lastExecErr != nil {
 		if n.ExecFallbackFunc != nil {
-			execRes, err = n.ExecFallbackFunc(prepRes, n.params, lastExecErr)
+			execRes, err = n.ExecFallbackFunc(ctx, n.params, prepRes, lastExecErr)
 			if err != nil {
 				// Wrap the fallback error, potentially including the original execution error
 				return "", newPocketFlowError(fmt.Sprintf("ExecFallback phase failed in %T after %d retries", n, n.MaxRetries), err)
@@ -318,14 +347,14 @@ type BatchNode struct {
 
 	// User-defined functions
 	// Prep returns a slice (or error)
-	PrepFunc func(ctx SharedContext, params SharedContext) ([]any, error)
+	PrepFunc func(ctx *PfContext, params map[string]any) ([]any, error)
 	// ExecItem operates on a single item from the Prep slice
-	ExecItemFunc func(item any, params SharedContext) (any, error)
+	ExecItemFunc func(ctx *PfContext, params map[string]any, item any) (any, error)
 	// Post receives the original prep slice and the slice of exec results
-	PostFunc func(ctx SharedContext, prepResult []any, execResult []any, params SharedContext) (string, error)
+	PostFunc func(ctx *PfContext, params map[string]any, prepResult []any, execResult []any) (string, error)
 
 	// Optional fallback for individual item processing
-	ExecItemFallbackFunc func(item any, params SharedContext, lastErr error) (any, error)
+	ExecItemFallbackFunc func(ctx *PfContext, params map[string]any, item any, lastErr error) (any, error)
 }
 
 // NewBatchNode creates a new BatchNode with default settings.
@@ -333,9 +362,9 @@ func NewBatchNode() *BatchNode {
 	bn := &BatchNode{
 		MaxRetries:       1,
 		WaitMilliseconds: 0,
-		PrepFunc:         func(ctx SharedContext, params SharedContext) ([]any, error) { return nil, nil },
-		ExecItemFunc:     func(item any, params SharedContext) (any, error) { return item, nil }, // Default pass-through
-		PostFunc: func(ctx SharedContext, prepResult []any, execResult []any, params SharedContext) (string, error) {
+		PrepFunc:         func(ctx *PfContext, params map[string]any) ([]any, error) { return nil, nil },
+		ExecItemFunc:     func(ctx *PfContext, params map[string]any, item any) (any, error) { return item, nil }, // Default pass-through
+		PostFunc: func(ctx *PfContext, params map[string]any, prepResult []any, execResult []any) (string, error) {
 			return DefaultAction, nil
 		},
 	}
@@ -357,25 +386,25 @@ func (bn *BatchNode) SetRetry(maxRetries int, waitMilliseconds time.Duration) *B
 }
 
 // SetPrep sets the PrepFunc. Expects a function returning []any.
-func (bn *BatchNode) SetPrep(f func(ctx SharedContext, params SharedContext) ([]any, error)) *BatchNode {
+func (bn *BatchNode) SetPrep(f func(ctx *PfContext, params map[string]any) ([]any, error)) *BatchNode {
 	bn.PrepFunc = f
 	return bn
 }
 
 // SetExecItem sets the ExecItemFunc for processing individual items.
-func (bn *BatchNode) SetExecItem(f func(item any, params SharedContext) (any, error)) *BatchNode {
+func (bn *BatchNode) SetExecItem(f func(ctx *PfContext, params map[string]any, item any) (any, error)) *BatchNode {
 	bn.ExecItemFunc = f
 	return bn
 }
 
 // SetPost sets the PostFunc. Receives []any prep and []any exec results.
-func (bn *BatchNode) SetPost(f func(ctx SharedContext, prepResult []any, execResult []any, params SharedContext) (string, error)) *BatchNode {
+func (bn *BatchNode) SetPost(f func(ctx *PfContext, params map[string]any, prepResult []any, execResult []any) (string, error)) *BatchNode {
 	bn.PostFunc = f
 	return bn
 }
 
 // SetItemFallback sets the ExecItemFallbackFunc.
-func (bn *BatchNode) SetItemFallback(f func(item any, params SharedContext, lastErr error) (any, error)) *BatchNode {
+func (bn *BatchNode) SetItemFallback(f func(ctx *PfContext, params map[string]any, item any, lastErr error) (any, error)) *BatchNode {
 	bn.ExecItemFallbackFunc = f
 	return bn
 }
@@ -392,7 +421,7 @@ func (bn *BatchNode) Next(action string, node BaseNode) BaseNode {
 }
 
 // Prep calls the user-defined PrepFunc.
-func (bn *BatchNode) Prep(ctx SharedContext) (any, error) {
+func (bn *BatchNode) Prep(ctx *PfContext) (any, error) {
 	if bn.PrepFunc == nil {
 		return nil, nil
 	}
@@ -401,7 +430,7 @@ func (bn *BatchNode) Prep(ctx SharedContext) (any, error) {
 }
 
 // Exec iterates through the prepResult slice, calling ExecItemFunc for each item with retries.
-func (bn *BatchNode) Exec(prepResult any) (any, error) {
+func (bn *BatchNode) Exec(ctx *PfContext, prepResult any) (any, error) {
 	if prepResult == nil {
 		return []any{}, nil // Return empty slice if prep was nil
 	}
@@ -425,7 +454,7 @@ func (bn *BatchNode) Exec(prepResult any) (any, error) {
 		lastItemErr = nil // Reset error for each item
 		itemSuccess := false
 		for currentRetry = 0; currentRetry < bn.MaxRetries; currentRetry++ {
-			itemResult, lastItemErr = bn.ExecItemFunc(item, bn.params)
+			itemResult, lastItemErr = bn.ExecItemFunc(ctx, bn.params, item)
 			if lastItemErr == nil {
 				itemSuccess = true
 				break // Success for this item
@@ -438,7 +467,7 @@ func (bn *BatchNode) Exec(prepResult any) (any, error) {
 		// If all retries failed for this item
 		if !itemSuccess {
 			if bn.ExecItemFallbackFunc != nil {
-				fallbackResult, fallbackErr := bn.ExecItemFallbackFunc(item, bn.params, lastItemErr)
+				fallbackResult, fallbackErr := bn.ExecItemFallbackFunc(ctx, bn.params, item, lastItemErr)
 				if fallbackErr != nil {
 					// Fallback failed, return error for the whole batch
 					return nil, newPocketFlowError(fmt.Sprintf("ExecItemFallback failed for item %d (%v) in %T after %d retries", i, item, bn, bn.MaxRetries), fallbackErr)
@@ -457,7 +486,7 @@ func (bn *BatchNode) Exec(prepResult any) (any, error) {
 }
 
 // Post calls the user-defined PostFunc.
-func (bn *BatchNode) Post(ctx SharedContext, prepResult any, execResult any) (string, error) {
+func (bn *BatchNode) Post(ctx *PfContext, prepResult any, execResult any) (string, error) {
 	// Type assertions needed as interface methods deal with 'any'
 	prepSlice, okPrep := prepResult.([]any)
 	if prepResult != nil && !okPrep { // Allow nil prepResult
@@ -469,21 +498,24 @@ func (bn *BatchNode) Post(ctx SharedContext, prepResult any, execResult any) (st
 		return "", newPocketFlowError(fmt.Sprintf("Internal error: execResult in BatchNode %T Post was not []any (%T)", bn, execResult), nil)
 	}
 	// Ensure slices are not nil if they were originally nil/empty, matching Java behaviour somewhat
-	if prepSlice == nil { prepSlice = []any{} }
-	if execSlice == nil { execSlice = []any{} }
-
+	if prepSlice == nil {
+		prepSlice = []any{}
+	}
+	if execSlice == nil {
+		execSlice = []any{}
+	}
 
 	if bn.PostFunc == nil {
 		return DefaultAction, nil
 	}
-	action, err := bn.PostFunc(ctx, prepSlice, execSlice, bn.params)
-    if err == nil && action == "" {
+	action, err := bn.PostFunc(ctx, bn.params, prepSlice, execSlice)
+	if err == nil && action == "" {
 		action = DefaultAction
 	}
 	return action, err
 }
 
-func (bn *BatchNode) Run(ctx SharedContext) (string, error) {
+func (bn *BatchNode) Run(ctx *PfContext) (string, error) {
 	if len(bn.successors) > 0 {
 		logWarn("Node %T has successors, but Run() was called directly. Successors won't be executed by this call. Use Flow.Run() for orchestration.", bn)
 	}
@@ -491,14 +523,14 @@ func (bn *BatchNode) Run(ctx SharedContext) (string, error) {
 }
 
 // InternalRun implements the retry logic at the item level within Exec.
-func (bn *BatchNode) InternalRun(ctx SharedContext) (string, error) {
+func (bn *BatchNode) InternalRun(ctx *PfContext) (string, error) {
 	prepRes, err := bn.Prep(ctx) // prepRes should be []any
 	if err != nil {
 		return "", newPocketFlowError(fmt.Sprintf("Prep phase failed in %T", bn), err)
 	}
 
 	// Exec handles its own item-level retry/fallback
-	execRes, err := bn.Exec(prepRes) // execRes should be []any
+	execRes, err := bn.Exec(ctx, prepRes) // execRes should be []any
 	if err != nil {
 		// Error from Exec already includes context about retries/fallbacks
 		return "", err // Don't wrap again
@@ -554,52 +586,45 @@ func (f *Flow) Next(action string, node BaseNode) BaseNode {
 }
 
 // Prep for the Flow itself. Default is no-op. Can be overridden if needed.
-func (f *Flow) Prep(ctx SharedContext) (any, error) {
+func (f *Flow) Prep(ctx *PfContext) (any, error) {
 	// Typically Flow prep is about setting up the context before orchestration starts
 	return nil, nil
 }
 
 // Exec for the Flow initiates the orchestration. Should not be called directly by user.
-func (f *Flow) Exec(prepResult any) (any, error) {
+func (f *Flow) Exec(ctx *PfContext, prepResult any) (any, error) {
 	// This is called internally by InternalRun after Flow's Prep.
 	// The 'prepResult' here is the result of Flow.Prep, not a node's prep.
 	// The 'execResult' of a Flow is the final action string from orchestration.
 	// We need the context here for orchestrate, assume prepResult is the context for simplicity
 	// although Flow's Prep doesn't *have* to return the context. Let's pass ctx directly.
 	// This requires changing the call site in InternalRun.
-	sharedCtx, ok := prepResult.(SharedContext)
-	if !ok {
-		// Fallback or error? Let's assume the caller (InternalRun) passed the correct context.
-		// This indicates an internal logic error if it happens.
-		return "", newPocketFlowError(fmt.Sprintf("Internal error: Flow.Exec expected SharedContext, got %T", prepResult), nil)
-	}
-
-	finalAction, err := f.orchestrate(sharedCtx, nil) // Run orchestration with the context
+	sharedCtx, _ := prepResult.(map[string]any)
+	finalAction, err := f.orchestrate(ctx, sharedCtx) // Run orchestration with the context
 	if err != nil {
 		return "", err // Return error, action is irrelevant if orchestration failed
 	}
 	return finalAction, nil // Return the final action as the result
 }
 
-
 // Post for the Flow runs after orchestration completes. Default returns the final action.
-func (f *Flow) Post(ctx SharedContext, prepResult any, execResult any) (string, error) {
+func (f *Flow) Post(ctx *PfContext, prepResult any, execResult any) (string, error) {
 	// prepResult is from Flow.Prep, execResult is the final action string from Exec/orchestrate.
 	finalAction, _ := execResult.(string) // Ignore error, default to "" if cast fails
-    if finalAction == "" {
-        finalAction = DefaultAction // Or maybe keep it empty? Let's default.
-    }
+	if finalAction == "" {
+		finalAction = DefaultAction // Or maybe keep it empty? Let's default.
+	}
 	return finalAction, nil
 }
 
 // Run starts the flow execution.
-func (f *Flow) Run(ctx SharedContext) (string, error) {
+func (f *Flow) Run(ctx *PfContext) (string, error) {
 	// Use InternalRun to perform the standard Flow lifecycle (Prep, Exec(orchestrate), Post)
 	return f.InternalRun(ctx)
 }
 
 // InternalRun executes the flow's lifecycle: Prep, Orchestrate (via Exec), Post.
-func (f *Flow) InternalRun(ctx SharedContext) (string, error) {
+func (f *Flow) InternalRun(ctx *PfContext) (string, error) {
 	// 1. Run Flow's Prep phase
 	flowPrepResult, err := f.Prep(ctx)
 	if err != nil {
@@ -608,7 +633,7 @@ func (f *Flow) InternalRun(ctx SharedContext) (string, error) {
 
 	// 2. Run Flow's Exec phase (which triggers orchestration)
 	// Pass the *original* shared context to Exec, as Exec now expects it.
-	flowExecResult, err := f.Exec(ctx) // Exec calls orchestrate
+	flowExecResult, err := f.Exec(ctx, flowPrepResult) // Exec calls orchestrate
 	if err != nil {
 		// Error likely came from a node within orchestrate
 		return "", err // Don't wrap again, error should be informative
@@ -623,11 +648,10 @@ func (f *Flow) InternalRun(ctx SharedContext) (string, error) {
 	return finalAction, nil
 }
 
-
 // orchestrate executes the node chain starting from startNode.
 // initialParams are merged with the flow's own params for the *first* node.
 // Returns the last action string and any error encountered.
-func (f *Flow) orchestrate(ctx SharedContext, initialParams SharedContext) (string, error) {
+func (f *Flow) orchestrate(ctx *PfContext, initialParams map[string]any) (string, error) {
 	if f.startNode == nil {
 		logWarn("Flow started with no start node.")
 		return "", nil // No error, just nothing to run
@@ -640,7 +664,7 @@ func (f *Flow) orchestrate(ctx SharedContext, initialParams SharedContext) (stri
 	// Prepare initial parameters for the first node run
 	// Combine Flow's params and any specific initialParams for this run
 	// Replace with manual copy loop:
-	combinedParams := make(SharedContext, len(f.params))
+	combinedParams := make(map[string]any, len(f.params))
 	for k, v := range f.params {
 		combinedParams[k] = v
 	}
@@ -652,20 +676,18 @@ func (f *Flow) orchestrate(ctx SharedContext, initialParams SharedContext) (stri
 		}
 	}
 
-
 	for currentNode != nil {
 		// Set the combined params *before* running the node
-        // Only apply combinedParams on the *first* iteration
+		// Only apply combinedParams on the *first* iteration
 		if combinedParams != nil {
-		    currentNode.SetParams(combinedParams)
-            combinedParams = nil // Clear after first use
-        } else {
-             // Ensure subsequent nodes get at least the Flow's base params if theirs are unset.
-             if len(currentNode.GetParams()) == 0 && len(f.params) > 0 {
-                  currentNode.SetParams(f.params) // Give it the flow's base params if it has none
-             }
-        }
-
+			currentNode.SetParams(combinedParams)
+			combinedParams = nil // Clear after first use
+		} else {
+			// Ensure subsequent nodes get at least the Flow's base params if theirs are unset.
+			if len(currentNode.GetParams()) == 0 && len(f.params) > 0 {
+				currentNode.SetParams(f.params) // Give it the flow's base params if it has none
+			}
+		}
 
 		// Execute the node's full lifecycle (Prep, Exec, Post)
 		lastAction, err = currentNode.InternalRun(ctx)
@@ -677,14 +699,13 @@ func (f *Flow) orchestrate(ctx SharedContext, initialParams SharedContext) (stri
 		// Get the next node based on the action returned by Post
 		currentNode = currentNode.GetNextNode(lastAction)
 
-        // Parameter propagation logic for subsequent nodes (revisit if needed)
-        // The current logic sets params once at the start or uses node's existing/flow base.
+		// Parameter propagation logic for subsequent nodes (revisit if needed)
+		// The current logic sets params once at the start or uses node's existing/flow base.
 	}
 
 	// Orchestration finished successfully, return the last action determined
 	return lastAction, nil
 }
-
 
 // --- Batch Flow ---
 
@@ -693,8 +714,8 @@ type BatchFlow struct {
 	Flow // Embed Flow to inherit its structure and orchestration logic
 
 	// User-defined functions for batch behavior
-	PrepBatchFunc func(ctx SharedContext, params SharedContext) ([]SharedContext, error)
-	PostBatchFunc func(ctx SharedContext, batchPrepResult []SharedContext, params SharedContext) (string, error)
+	PrepBatchFunc func(ctx *PfContext, params map[string]any) ([]map[string]any, error)
+	PostBatchFunc func(ctx *PfContext, params map[string]any, batchPrepResult []map[string]any) (string, error)
 }
 
 // NewBatchFlow creates a new BatchFlow.
@@ -704,40 +725,41 @@ func NewBatchFlow(startNode BaseNode) *BatchFlow {
 			startNode: startNode,
 		},
 		// Provide sensible defaults?
-		PrepBatchFunc: func(ctx SharedContext, params SharedContext) ([]SharedContext, error) { return nil, nil },
-		PostBatchFunc: func(ctx SharedContext, batchPrepResult []SharedContext, params SharedContext) (string, error) { return DefaultAction, nil },
+		PrepBatchFunc: func(ctx *PfContext, params map[string]any) ([]map[string]any, error) { return nil, nil },
+		PostBatchFunc: func(ctx *PfContext, params map[string]any, batchPrepResult []map[string]any) (string, error) {
+			return DefaultAction, nil
+		},
 	}
-	bf.initCore() // Initialize nodeCore for the BatchFlow itself
+	bf.initCore()      // Initialize nodeCore for the BatchFlow itself
 	bf.Flow.initCore() // Ensure embedded Flow's core is also initialized
 	return bf
 }
 
 // SetPrepBatch sets the function to generate batch parameters.
-func (bf *BatchFlow) SetPrepBatch(f func(ctx SharedContext, params SharedContext) ([]SharedContext, error)) *BatchFlow {
+func (bf *BatchFlow) SetPrepBatch(f func(ctx *PfContext, params map[string]any) ([]map[string]any, error)) *BatchFlow {
 	bf.PrepBatchFunc = f
 	return bf
 }
 
 // SetPostBatch sets the function to run after all batches complete.
-func (bf *BatchFlow) SetPostBatch(f func(ctx SharedContext, batchPrepResult []SharedContext, params SharedContext) (string, error)) *BatchFlow {
+func (bf *BatchFlow) SetPostBatch(f func(ctx *PfContext, params map[string]any, batchPrepResult []map[string]any) (string, error)) *BatchFlow {
 	bf.PostBatchFunc = f
 	return bf
 }
 
-
 // --- BaseNode Implementation Overrides for BatchFlow ---
 
 // Prep for BatchFlow runs its PrepBatchFunc.
-func (bf *BatchFlow) Prep(ctx SharedContext) (any, error) {
+func (bf *BatchFlow) Prep(ctx *PfContext) (any, error) {
 	if bf.PrepBatchFunc == nil {
 		return nil, nil
 	}
-	// Returns []SharedContext
+	// Returns []*pfContext
 	return bf.PrepBatchFunc(ctx, bf.params)
 }
 
 // Exec for BatchFlow runs the orchestration for each batch item.
-// The 'prepResult' here is the []SharedContext from BatchFlow.Prep.
+// The 'prepResult' here is the []*pfContext from BatchFlow.Prep.
 func (bf *BatchFlow) Exec(prepResult any) (any, error) {
 	// We need the original context for the orchestrate calls.
 	// InternalRun should pass it. For now, let's assume prepResult contains it implicitly
@@ -745,75 +767,73 @@ func (bf *BatchFlow) Exec(prepResult any) (any, error) {
 	// Safest: Assume InternalRun passes the context correctly and prepResult is the list.
 	// Let's adjust the call site in InternalRun.
 
-	batchParamsList, ok := prepResult.([]SharedContext)
-    if prepResult != nil && !ok {
-        return "", newPocketFlowError(fmt.Sprintf("Internal error: prepResult in BatchFlow %T Exec was not []SharedContext (%T)", bf, prepResult), nil)
-    }
-     if batchParamsList == nil {
-		 batchParamsList = []SharedContext{}
-	 }
+	batchParamsList, ok := prepResult.([]*PfContext)
+	if prepResult != nil && !ok {
+		return "", newPocketFlowError(fmt.Sprintf("Internal error: prepResult in BatchFlow %T Exec was not []*pfContext (%T)", bf, prepResult), nil)
+	}
+	if batchParamsList == nil {
+		batchParamsList = []*PfContext{}
+	}
 
-    // We need the actual SharedContext. Where does it come from?
-    // It should be passed *alongside* the prepResult by InternalRun.
-    // Let's redefine Exec slightly to accept it, or rely on a field.
-    // Simpler: Let InternalRun handle context passing to orchestrate directly.
-    // Exec just needs to return the batchParamsList for Post.
+	// We need the actual *pfContext. Where does it come from?
+	// It should be passed *alongside* the prepResult by InternalRun.
+	// Let's redefine Exec slightly to accept it, or rely on a field.
+	// Simpler: Let InternalRun handle context passing to orchestrate directly.
+	// Exec just needs to return the batchParamsList for Post.
 
 	// The actual orchestration happens in InternalRun using this list.
 	// This function's role is primarily semantic within the BaseNode interface call chain.
 	// It returns the data needed for Post.
 
-    return batchParamsList, nil
+	return batchParamsList, nil
 }
 
-
 // Post for BatchFlow runs its PostBatchFunc.
-func (bf *BatchFlow) Post(ctx SharedContext, prepResult any, execResult any) (string, error) {
-	// prepResult is the result of BatchFlow.Prep ([]SharedContext)
-	// execResult is the result of BatchFlow.Exec (which we defined as the same []SharedContext)
+func (bf *BatchFlow) Post(ctx *PfContext, prepResult any, execResult any) (string, error) {
+	// prepResult is the result of BatchFlow.Prep ([]*pfContext)
+	// execResult is the result of BatchFlow.Exec (which we defined as the same []*pfContext)
 
-    batchPrepResult, okPrep := prepResult.([]SharedContext)
+	batchPrepResult, okPrep := prepResult.([]map[string]any)
 	if prepResult != nil && !okPrep {
-        return "", newPocketFlowError(fmt.Sprintf("Internal error: prepResult in BatchFlow %T Post was not []SharedContext (%T)", bf, prepResult), nil)
-    }
-     if batchPrepResult == nil {
-		 batchPrepResult = []SharedContext{}
-	 }
+		return "", newPocketFlowError(fmt.Sprintf("Internal error: prepResult in BatchFlow %T Post was not []*pfContext (%T)", bf, prepResult), nil)
+	}
+	if batchPrepResult == nil {
+		batchPrepResult = []map[string]any{}
+	}
 
 	if bf.PostBatchFunc == nil {
 		return DefaultAction, nil
 	}
 
-	action, err := bf.PostBatchFunc(ctx, batchPrepResult, bf.params)
-    if err == nil && action == "" {
+	action, err := bf.PostBatchFunc(ctx, bf.params, batchPrepResult)
+	if err == nil && action == "" {
 		action = DefaultAction
 	}
 	return action, err
 }
 
-
 // Run starts the BatchFlow execution.
-func (bf *BatchFlow) Run(ctx SharedContext) (string, error) {
+func (bf *BatchFlow) Run(ctx *PfContext) (string, error) {
 	// Use InternalRun to perform the standard lifecycle (PrepBatch, Exec Batches, PostBatch)
 	return bf.InternalRun(ctx)
 }
 
 // InternalRun executes the BatchFlow lifecycle: PrepBatch, Exec(orchestrate per batch), PostBatch.
-func (bf *BatchFlow) InternalRun(ctx SharedContext) (string, error) {
+func (bf *BatchFlow) InternalRun(ctx *PfContext) (string, error) {
 	// 1. Run BatchFlow's Prep phase (PrepBatchFunc)
-	// Should return []SharedContext
+	// Should return []*pfContext
 	prepBatchResultAny, err := bf.Prep(ctx)
 	if err != nil {
 		return "", newPocketFlowError(fmt.Sprintf("PrepBatch phase failed for BatchFlow %T", bf), err)
 	}
 
-    batchParamsList, ok := prepBatchResultAny.([]SharedContext)
+	batchParamsList, ok := prepBatchResultAny.([]map[string]any)
 	if prepBatchResultAny != nil && !ok {
-        return "", newPocketFlowError(fmt.Sprintf("Internal error: PrepBatch phase in BatchFlow %T did not return []SharedContext (%T)", bf, prepBatchResultAny), nil)
-    }
-     if batchParamsList == nil {
-		 batchParamsList = []SharedContext{}
-	 }
+		return "", newPocketFlowError(fmt.Sprintf("Internal error: PrepBatch phase in BatchFlow %T did not return []*pfContext (%T)", bf, prepBatchResultAny), nil)
+	}
+	if batchParamsList == nil {
+		batchParamsList = []map[string]any{}
+	}
 
 	// 2. Run the orchestration for each item in batchParamsList
 	for i, batchParams := range batchParamsList {
@@ -836,15 +856,4 @@ func (bf *BatchFlow) InternalRun(ctx SharedContext) (string, error) {
 	}
 
 	return finalAction, nil
-}
-
-
-// --- Type checking helper (optional but potentially useful) ---
-// Example: Check if a result from 'any' is actually an int
-func expectInt(val any, nodeType string, phase string) (int, error) {
-	i, ok := val.(int)
-	if !ok {
-		return 0, newPocketFlowError(fmt.Sprintf("%s phase in %s expected int, got %T", phase, nodeType, val), nil)
-	}
-	return i, nil
 }
