@@ -1,0 +1,31 @@
+name: UnitTests
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+permissions:
+  contents: read # access to check out code and install dependencies
+
+jobs:
+  test:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Test with recomended, stable and latest Go versions
+        go: [ '1.18', 'stable', '1' ]
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+
+      - name: Run tests (w/race condition)
+        run: |
+          go test -v -race ./... || exit 1

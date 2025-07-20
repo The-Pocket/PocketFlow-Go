@@ -1,3 +1,5 @@
+[![Go Reference](https://pkg.go.dev/badge/github.com/The-Pocket/PocketFlow-Go.svg)](https://pkg.go.dev/github.com/The-Pocket/PocketFlow-Go)
+
 # PocketFlow Go
 
 A minimalist LLM framework concept, ported from Python to Go.
@@ -24,6 +26,7 @@ Here's a simple example of how to use PocketFlow Go in your application:
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 
@@ -34,36 +37,40 @@ import (
 
 // myStartNode creates a node that starts the workflow.
 func myStartNode() pf.BaseNode {
-	return pf.NewNode().
-		SetExec(func(prepResult any, params pf.SharedContext) (any, error) {
-			log.Println("Starting workflow...")
-			// Exec result can be used by Post to determine action
-			return "started_data", nil
-		}).
-		SetPost(func(ctx pf.SharedContext, prepResult any, execResult any, params pf.SharedContext) (string, error) {
-			// Use execResult to decide the next step
-			log.Printf("Start node finished with data: %v\n", execResult)
-			ctx["start_result"] = execResult // Optional: Update shared context
-			return "started", nil            // Action name to trigger the next node
-		})
+	fnExec := func(ctx *pf.PfContext, params map[string]any, prepResult any) (any, error) {
+		fmt.Println("LOG: Starting workflow...")
+		execResult := "started_data" // Assume this is the result of some operation
+		return execResult, nil       // Exec result can be used by Post to determine action
+	}
+
+	fnPost := func(ctx *pf.PfContext, params map[string]any, prepResult any, execResult any) (string, error) {
+		// Use execResult to decide the next step
+		fmt.Printf("LOG: Start node finished with data: %v\n", execResult)
+		ctx.SetValue("start_result", execResult) // Optional: Set/update shared context key/value
+		return "started", nil                    // Action name to trigger the next node
+	}
+
+	return pf.NewNode().SetExec(fnExec).SetPost(fnPost)
 }
 
 // myEndNode creates a node that ends the workflow.
 func myEndNode() pf.BaseNode {
-	return pf.NewNode().
-		SetPrep(func(ctx pf.SharedContext, params pf.SharedContext) (any, error) {
-			// Prep can access the shared context
-			startData := ctx["start_result"]
-			prepMsg := fmt.Sprintf("Preparing to end workflow, received: %v", startData)
-			log.Println(prepMsg)
-			return prepMsg, nil // Prep result passed to Exec
-		}).
-		SetExec(func(prepResult any, params pf.SharedContext) (any, error) {
-			prepMsg := prepResult.(string) // Assume prep result is string
-			log.Printf("Ending workflow with: %s\n", prepMsg)
-			// End nodes often don't need to return data
-			return nil, nil
-		})
+	fnPrep := func(ctx *pf.PfContext, params map[string]any) (any, error) {
+		// Prep can access the shared context
+		startData := ctx.Value("start_result")
+		prepMsg := fmt.Sprintf("Preparing to end workflow, received: %v", startData)
+		fmt.Println("LOG: " + prepMsg)
+		return prepMsg, nil // Prep result passed to Exec
+	}
+
+	fnExec := func(ctx *pf.PfContext, params map[string]any, prepResult any) (any, error) {
+		prepMsg := prepResult.(string) // Assume prep result is string
+		fmt.Printf("LOG: Ending workflow with: \"%s\"\n", prepMsg)
+		// End nodes often don't need to return data
+		return nil, nil
+	}
+
+	return pf.NewNode().SetPrep(fnPrep).SetExec(fnExec)
 	// Default Post (returns DefaultAction) is fine here
 }
 
@@ -79,17 +86,27 @@ func main() {
 	flow := pf.NewFlow(startNode)
 
 	// Create a context and run the flow
-	context := make(pf.SharedContext)
-	log.Println("Executing workflow...")
-	finalAction, err := flow.Run(context)
+	baseCtx, cancel := context.WithCancel(context.TODO())
+	defer cancel()                      // Ensure context is cancelled to avoid leaks
+	myCtx := pf.WithParam(baseCtx, nil) // Create a new PocketFlow context
+
+	fmt.Println("LOG: Executing workflow...")
+	finalAction, err := flow.Run(myCtx)
 	if err != nil {
 		log.Fatalf("Workflow failed: %v\n", err)
 	}
 
-	log.Printf("Workflow completed successfully. Final action: %s\n", finalAction)
-	log.Printf("Final Context: %v\n", context)
+	fmt.Printf("LOG: Workflow completed successfully. Final action: %s\n", finalAction)
+	fmt.Printf("LOG: Final Context: %v\n", myCtx)
+	// Output:
+	// LOG: Executing workflow...
+	// LOG: Starting workflow...
+	// LOG: Start node finished with data: started_data
+	// LOG: Preparing to end workflow, received: started_data
+	// LOG: Ending workflow with: "Preparing to end workflow, received: started_data"
+	// LOG: Workflow completed successfully. Final action: default
+	// LOG: Final Context: &{context.TODO.WithCancel map[start_result:started_data]}
 }
-
 ```
 
 ## Development
