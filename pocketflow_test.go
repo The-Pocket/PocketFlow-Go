@@ -61,8 +61,8 @@ func addNumberNode(numberToAdd int) pf.BaseNode {
 	return n
 }
 
-// resultCaptureNode creates a node that captures the context value into its own params.
-func resultCaptureNode() pf.BaseNode {
+// resultCaptureNode records the current value under the supplied shared-state key.
+func resultCaptureNode(key string) pf.BaseNode {
 	n := pf.NewNode().
 		SetPrep(func(ctx *pf.PfContext, params map[string]any) (any, error) {
 			// 原代码：val, ok := ctx["currentValue"]
@@ -80,10 +80,10 @@ func resultCaptureNode() pf.BaseNode {
 		}).
 		SetExec(func(ctx *pf.PfContext, params map[string]any, prepResult any) (any, error) {
 			capturedVal := prepResult.(int)
-			params["capturedValue"] = capturedVal // Store in node's *own* params
-			return nil, nil                       // No meaningful exec result needed
+			ctx.SetValue(key, capturedVal)
+			return nil, nil // No meaningful exec result needed
 		})
-	// Default Post is sufficient (returns DefaultAction)
+	// Default Post returns an empty action.
 	return n
 }
 
@@ -110,7 +110,7 @@ func simpleLogNode() pf.BaseNode {
 func TestSimpleLinearFlow(t *testing.T) {
 	start := setNumberNode(10)
 	add := addNumberNode(5)
-	capture := resultCaptureNode()
+	capture := resultCaptureNode("capturedValue")
 
 	// Connect nodes: start -> add (on default) -> capture (on "added")
 	start.Next(pf.DefaultAction, add).Next("added", capture)
@@ -121,21 +121,20 @@ func TestSimpleLinearFlow(t *testing.T) {
 	lastAction, err := flow.Run(sharedContext)
 	require.NoError(t, err)
 
-	// Capture node is the last one, its default post returns "default"
-	assert.Equal(t, pf.DefaultAction, lastAction) // Flow's post returns last node's action
+	// Empty actions select default edges but remain empty in the return value.
+	assert.Empty(t, lastAction)
 	// 原代码：assert.Equal(t, 15, sharedContext["currentValue"])
 	assert.Equal(t, 15, sharedContext.Value("currentValue"))
 
-	// Check the captured value in the capture node's *own* parameters
-	captureParams := capture.GetParams()
-	assert.Equal(t, 15, captureParams["capturedValue"])
+	assert.Equal(t, 15, sharedContext.Value("capturedValue"))
+	assert.Empty(t, capture.GetParams(), "runtime state must not mutate the graph")
 }
 
 func TestBranchingFlow(t *testing.T) {
 	start := setNumberNode(10)
 	add := addNumberNode(5)
-	captureDefault := resultCaptureNode()
-	captureOver20 := resultCaptureNode()
+	captureDefault := resultCaptureNode("capturedDefault")
+	captureOver20 := resultCaptureNode("capturedOver20")
 
 	// Connections:
 	// start -> add (on default) -> captureDefault (on "added")
@@ -152,23 +151,14 @@ func TestBranchingFlow(t *testing.T) {
 	lastAction, err := flow.Run(sharedContext)
 	require.NoError(t, err)
 
-	// The flow should take the "over_20" branch to captureOver20, which returns "default"
-	assert.Equal(t, pf.DefaultAction, lastAction)
+	assert.Empty(t, lastAction)
 	// 原代码：assert.Equal(t, 30, sharedContext["currentValue"])
 	assert.Equal(t, 30, sharedContext.Value("currentValue"))
 
-	// Check the correct capture node got the value
-	captureOver20Params := captureOver20.GetParams()
-	captureDefaultParams := captureDefault.GetParams()
-
-	assert.Equal(t, 30, captureOver20Params["capturedValue"])
-	_, existsDefault := captureDefaultParams["capturedValue"]
-	assert.False(t, existsDefault, "captureDefault should not have captured a value")
-	// Check default value wasn't accidentally set if GetParams() returns nil map initially
-	if defaultVal, ok := captureDefaultParams["capturedValue"]; ok {
-		assert.NotEqual(t, -999, defaultVal, "Default prep value should not be in params")
-	}
-
+	assert.Equal(t, 30, sharedContext.Value("capturedOver20"))
+	assert.Nil(t, sharedContext.Value("capturedDefault"), "default branch must not execute")
+	assert.Empty(t, captureOver20.GetParams())
+	assert.Empty(t, captureDefault.GetParams())
 }
 
 func TestBatchFlowExecution(t *testing.T) {
@@ -241,7 +231,7 @@ func TestNodeRetryFailureWithFallback(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, execCount, "Exec should have been called 2 times")
 	assert.True(t, fallbackCalled, "Fallback should have been called")
-	assert.Equal(t, pf.DefaultAction, action) // Default post action
+	assert.Empty(t, action) // Empty post action, as Python's None.
 }
 
 func TestNodeRetryFailureWithoutFallback(t *testing.T) {

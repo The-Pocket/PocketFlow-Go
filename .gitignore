@@ -57,3 +57,6 @@ desktop.ini
 
 # Add any other project-specific files or directories to ignore below
 # e.g., local data files, temporary build artifacts, etc.
+# Optional checkout used by Python behavior tests.
+.python-reference/
+__pycache__/
