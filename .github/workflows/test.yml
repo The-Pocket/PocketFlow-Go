@@ -1,0 +1,43 @@
+name: SDK behavior
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        go: ['1.18.x', stable]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: go.sum
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - uses: actions/checkout@v7
+        with:
+          repository: The-Pocket/PocketFlow
+          ref: f74d023f93607b8c3268133339a5e532a949898c
+          path: .python-reference
+          persist-credentials: false
+      - run: go test ./...
+        env:
+          POCKETFLOW_PYTHON_PATH: .python-reference
+      - run: go vet ./...
+      - run: go run ./examples/workflow
+      - run: go run ./examples/parallel
+      - run: go run ./examples/nested
+      - if: runner.os == 'Linux' && matrix.go == 'stable'
+        run: go test -race ./...
+        env:
+          POCKETFLOW_PYTHON_PATH: .python-reference
